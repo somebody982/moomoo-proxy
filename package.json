@@ -2,9 +2,9 @@
   "name": "moomoo-syncbot-proxy",
   "version": "1.0.0",
   "description": "WebSocket proxy for MooMoo.io SyncBots",
-  "main": "cloud_proxy_server.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node cloud_proxy_server.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "ws": "^8.14.2",
