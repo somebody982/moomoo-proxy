@@ -1,13 +1,18 @@
 {
-  "name": "moomoo-proxy",
+  "name": "moomoo-syncbot-proxy",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "WebSocket proxy for MooMoo.io SyncBots",
+  "main": "cloud_proxy_server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node cloud_proxy_server.js"
   },
   "dependencies": {
     "ws": "^8.14.2",
     "https-proxy-agent": "^7.0.2",
-    "socks-proxy-agent": "^8.0.2"
+    "socks-proxy-agent": "^8.0.2",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
