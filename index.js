@@ -252,9 +252,24 @@ wss.on('connection', async (clientWs, req) => {
     // Connect to MooMoo
     const upstream = new WebSocket(moomooUrl, wsOptions);
     
+    // Keepalive ping interval
+    let keepAliveInterval = null;
+    const KEEPALIVE_MS = 20000; // Ping every 20 seconds
+    
     upstream.on('open', () => {
         console.log(`[${botName}] CONNECTED to MooMoo via ${proxyHost}!`);
         upstreamReady = true;
+        
+        // Start keepalive pings
+        keepAliveInterval = setInterval(() => {
+            try {
+                if (upstream.readyState === WebSocket.OPEN) {
+                    upstream.ping();
+                }
+            } catch (e) {
+                console.error(`[${botName}] Keepalive ping error:`, e.message);
+            }
+        }, KEEPALIVE_MS);
         
         // Flush queued messages
         while (messageQueue.length > 0) {
@@ -269,20 +284,51 @@ wss.on('connection', async (clientWs, req) => {
         }
     });
     
+    // Handle pong responses (optional logging)
+    upstream.on('pong', () => {
+        // Connection is alive
+    });
+    
     upstream.on('close', (code, reason) => {
         const reasonStr = reason ? reason.toString() : '';
         console.log(`[${botName}] MooMoo closed: ${code} ${reasonStr}`);
         upstreamReady = false;
+        
+        // Clear keepalive
+        if (keepAliveInterval) {
+            clearInterval(keepAliveInterval);
+            keepAliveInterval = null;
+        }
+        
         if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.close(code, reason);
+            // WebSocket close codes 1004-1006 and 1015 are reserved and cannot be sent
+            // Use 1000 (normal) or 1001 (going away) instead
+            const safeCode = (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999) ? code : 1000;
+            try {
+                clientWs.close(safeCode, reasonStr.slice(0, 123)); // reason max 123 bytes
+            } catch (e) {
+                console.error(`[${botName}] Error closing client:`, e.message);
+                try { clientWs.terminate(); } catch {}
+            }
         }
     });
     
     upstream.on('error', (err) => {
         console.error(`[${botName}] MooMoo error:`, err.message);
         upstreamReady = false;
+        
+        // Clear keepalive
+        if (keepAliveInterval) {
+            clearInterval(keepAliveInterval);
+            keepAliveInterval = null;
+        }
+        
         if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.close(1011, 'Upstream error');
+            try {
+                clientWs.close(1011, 'Upstream error');
+            } catch (e) {
+                try { clientWs.terminate(); } catch {}
+            }
         }
     });
     
@@ -295,10 +341,21 @@ wss.on('connection', async (clientWs, req) => {
         }
     });
     
-    clientWs.on('close', () => {
+    clientWs.on('close', (code, reason) => {
         console.log(`[${botName}] Client closed`);
+        
+        // Clear keepalive
+        if (keepAliveInterval) {
+            clearInterval(keepAliveInterval);
+            keepAliveInterval = null;
+        }
+        
         if (upstream.readyState === WebSocket.OPEN) {
-            upstream.close();
+            try {
+                upstream.close();
+            } catch (e) {
+                try { upstream.terminate(); } catch {}
+            }
         }
     });
     
