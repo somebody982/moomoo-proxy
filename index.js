@@ -1,337 +1,226 @@
-// ===========================================================================
-// MOOMOO.IO WEBSOCKET PROXY - CLOUD VERSION (Matching working proxy-server.js)
-// ===========================================================================
-
 const WebSocket = require('ws');
+const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const { SocksProxyAgent } = require('socks-proxy-agent');
 
-// Use node-fetch for token generation (more reliable)
-let fetch;
-try {
-    fetch = require('node-fetch');
-} catch (e) {
-    // Fallback to native fetch in Node 18+
-    fetch = globalThis.fetch;
-}
-
-// Proxy agents
-const { HttpsProxyAgent } = require('https-proxy-agent');
-let SocksProxyAgent;
-try {
-    SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent;
-} catch (e) {
-    console.log('[Proxy] SOCKS support not available');
-}
-
-// Configuration
+// ==========================================
+// ZOMBIE COMMANDER PROXY v6 — ROTATING SOCKS5 PROXY
+// ==========================================
 const PORT = process.env.PORT || 8080;
-const TOKEN_RATE_WINDOW_MS = 400;  // Throttle token fetches
-const DIAL_JITTER_MS = [120, 320]; // Random delay before dialing
-const KEEPALIVE_MS = 20000;        // Ping every 20 seconds
 
-const BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5282.106 Safari/537.36',
+// ========== LOAD PROXIES FROM SECRET FILE ==========
+let PROXY_LIST =[];
+try {
+    // Reads the proxy list securely provided by Render Secret Files
+    const proxyData = fs.readFileSync('proxies.json', 'utf8');
+    PROXY_LIST = JSON.parse(proxyData);
+    console.log(`[+] Successfully loaded ${PROXY_LIST.length} proxies from proxies.json`);
+} catch (err) {
+    console.error('[!] Failed to load proxies.json. Make sure the Secret File is configured in Render.');
+    PROXY_LIST =[];
+}
+
+let proxyCursor = 0;
+function getNextProxy() {
+    if (PROXY_LIST.length === 0) return null;
+    const p = PROXY_LIST[proxyCursor];
+    proxyCursor = (proxyCursor + 1) % PROXY_LIST.length;
+    return p;
+}
+
+// ========== SOCKS5 PROXY AGENT ==========
+function getProxyAgent(proxy) {
+    if (!proxy) return new https.Agent(); // Fallback to direct if no proxies exist
+    
+    // Construct the SOCKS5 connection URI using credentials
+    // Using encodeURIComponent protects against special characters in usernames/passwords
+    const proxyUrl = `socks5://${encodeURIComponent(proxy.user)}:${encodeURIComponent(proxy.pass)}@${proxy.host}:${proxy.port}`;
+    
+    return new SocksProxyAgent(proxyUrl);
+}
+
+const HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Origin': 'https://moomoo.io',
     'Referer': 'https://moomoo.io/',
     'Accept-Language': 'en-US,en;q=0.9'
 };
 
-// Proxy state
-let proxyList = [];
-let proxyState = []; // { active, lastTokenAt }
-let rrCursor = 0;
+// ========== SERIALIZED TOKEN FETCHING ==========
+let tokenChain = Promise.resolve();
 
-// Helpers
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const rint = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-
-function loadProxies() {
-    const proxiesEnv = process.env.PROXIES || '';
-    if (!proxiesEnv) {
-        console.error('[Proxy] No PROXIES environment variable set!');
-        return false;
-    }
-    
-    proxyList = proxiesEnv.split(',').map(p => p.trim()).filter(Boolean);
-    
-    // Normalize socks5 to socks5h (DNS through proxy)
-    proxyList = proxyList.map(p => p.replace(/^socks5:\/\//i, 'socks5h://'));
-    
-    proxyState = proxyList.map(() => ({ active: 0, lastTokenAt: 0 }));
-    
-    if (proxyList.length === 0) {
-        console.error('[Proxy] No valid proxies found');
-        return false;
-    }
-    
-    console.log(`[Proxy] Loaded ${proxyList.length} proxy(ies)`);
-    return true;
+function generateToken(logName, agent, label) {
+    tokenChain = tokenChain.catch(() => {}).then(() => _generateToken(logName, agent, label));
+    return tokenChain;
 }
 
-function pickProxyIndex() {
-    const n = proxyList.length;
-    if (n === 0) return -1;
-    
-    // Simple round-robin
-    const idx = rrCursor % n;
-    rrCursor = (rrCursor + 1) % n;
-    return idx;
+function _generateToken(logName, tokenAgent, label) {
+    return new Promise((resolve) => {
+        console.log(`[${logName}] Fetching token via ${label}...`);
+        const start = Date.now();
+
+        const req = https.request({
+            hostname: 'api.moomoo.io',
+            path: '/verify',
+            method: 'GET',
+            agent: tokenAgent, // Connects via SOCKS5 proxy
+            headers: HEADERS
+        }, (res) => {
+            let body = '';
+            res.on('data', chunk => body += chunk);
+            res.on('end', () => {
+                try {
+                    if (res.statusCode !== 200) {
+                        console.log(`[X] Verify HTTP ${res.statusCode} (${Date.now() - start}ms)`);
+                        return resolve(null);
+                    }
+
+                    const data = JSON.parse(body);
+                    for (let i = 0; i <= data.maxnumber; i++) {
+                        if (crypto.createHash('sha256').update(data.salt + i).digest('hex') === data.challenge) {
+                            console.log(`[${logName}] Token solved in ${Date.now() - start}ms (n=${i})`);
+                            return resolve('alt:' + Buffer.from(JSON.stringify({
+                                algorithm: 'SHA-256',
+                                challenge: data.challenge,
+                                salt: data.salt,
+                                number: i,
+                                signature: data.signature,
+                                took: Date.now() - start
+                            })).toString('base64'));
+                        }
+                    }
+                    console.log(`[X] ${logName}: Unsolvable (maxnumber=${data.maxnumber})`);
+                    resolve(null);
+                } catch (e) {
+                    console.log(`[X] Token Parse Error: ${e.message}`);
+                    resolve(null);
+                }
+            });
+        });
+
+        req.on('error', (e) => {
+            console.log(`[X] Token Request Error: ${e.message}`);
+            resolve(null);
+        });
+
+        req.end();
+    });
 }
 
-function makeAgent(proxyUrl) {
-    if (!proxyUrl) return null;
-    if (/^socks/i.test(proxyUrl)) {
-        if (!SocksProxyAgent) return null;
-        return new SocksProxyAgent(proxyUrl);
-    }
-    return new HttpsProxyAgent(proxyUrl);
-}
+// ========== SERVER SETUP ==========
+const server = http.createServer();
 
-function getProxyHost(proxyUrl) {
-    try {
-        const parsed = new URL(proxyUrl);
-        return `${parsed.hostname}:${parsed.port}`;
-    } catch {
-        return 'unknown';
-    }
-}
+const wss = new WebSocket.Server({
+    server,
+    perMessageDeflate: false
+});
 
-// Token generation using node-fetch (matching working version)
-async function generateToken(agent, proxyIdx) {
-    // Rate limit per proxy
-    if (proxyIdx >= 0 && proxyState[proxyIdx]) {
-        const until = proxyState[proxyIdx].lastTokenAt + TOKEN_RATE_WINDOW_MS - Date.now();
-        if (until > 0) await sleep(until);
-        proxyState[proxyIdx].lastTokenAt = Date.now();
+server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 15000);
+});
+
+// ========== CONNECTION HANDLER ==========
+wss.on('connection', async (clientWs, req) => {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const target = url.searchParams.get('region') || url.searchParams.get('target');
+    const botName = url.searchParams.get('name') || 'Zombie';
+
+    if (!target) {
+        console.log(`[X] Rejected: No region.`);
+        return clientWs.close();
     }
-    
-    try {
-        const fetchOptions = {
-            headers: BROWSER_HEADERS
-        };
-        if (agent) {
-            fetchOptions.agent = agent;
+
+    const proxy = getNextProxy();
+    const connAgent = getProxyAgent(proxy);
+    const connLabel = proxy ? `SOCKS5 ${proxy.host}:${proxy.port}` : 'Direct Connection';
+
+    const connStart = Date.now();
+    console.log(`\n[+] ${botName} -> ${target} via ${connLabel}`);
+
+    // Queue for messages received before upstream is ready
+    const messageQueue =[];
+    let upstreamReady = false;
+    let gameWs; 
+
+    // ===== TOKEN ACQUISITION =====
+    const token = await generateToken(botName, connAgent, connLabel);
+    if (!token) {
+        console.log(`[X] ${botName}: Token failed.`);
+        return clientWs.close();
+    }
+
+    // Attach relay listener
+    clientWs.on('message', (data) => {
+        if (upstreamReady && gameWs && gameWs.readyState === WebSocket.OPEN) {
+            gameWs.send(data);
+        } else {
+            messageQueue.push(data);
         }
-        
-        const resp = await fetch('https://api.moomoo.io/verify', fetchOptions);
-        if (!resp.ok) {
-            console.error('[Token] Verify request failed:', resp.status);
-            return null;
-        }
-        
-        const data = await resp.json();
-        const { challenge, salt, maxnumber, signature } = data;
-        
-        if (!challenge || !salt || maxnumber === undefined) {
-            console.error('[Token] Invalid challenge data');
-            return null;
-        }
-        
-        console.log(`[Token] Solving challenge, max: ${maxnumber}`);
-        
-        for (let i = 0; i <= maxnumber; i++) {
-            const hash = crypto.createHash('sha256').update(salt + i).digest('hex');
-            if (hash === challenge) {
-                console.log(`[Token] Solved at: ${i}`);
-                const payload = {
-                    algorithm: 'SHA-256',
-                    challenge,
-                    salt,
-                    number: i,
-                    signature: signature || null,
-                    took: 'cloud'
-                };
-                return 'alt:' + Buffer.from(JSON.stringify(payload)).toString('base64');
+    });
+
+    // ===== CONNECT TO GAME =====
+    const hostOnly = target.split(':')[0];
+    gameWs = new WebSocket(`wss://${target}/?token=${encodeURIComponent(token)}`, {
+        agent: connAgent, // WebSocket routes via SOCKS5 proxy
+        servername: hostOnly,
+        headers: HEADERS,
+        perMessageDeflate: false,
+        skipUTF8Validation: true
+    });
+
+    gameWs.on('open', () => {
+        const elapsed = Date.now() - connStart;
+        console.log(`[>>] ${botName} CONNECTED to game in ${elapsed}ms`);
+
+        upstreamReady = true;
+        while (messageQueue.length > 0) {
+            const msg = messageQueue.shift();
+            if (gameWs.readyState === WebSocket.OPEN) {
+                gameWs.send(msg);
             }
         }
-        
-        console.error('[Token] Failed to solve challenge');
-        return null;
-    } catch (e) {
-        console.error('[Token] Error:', e.message);
-        return null;
-    }
-}
+    });
 
-// Load proxies
-if (!loadProxies()) {
-    console.error('[Proxy] Running without external proxies');
-}
+    gameWs.on('message', (data) => {
+        if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(data);
+        }
+    });
 
-// HTTP server for health checks
-const server = http.createServer((req, res) => {
-    if (req.url === '/health' || req.url === '/') {
-        res.writeHead(200, { 
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*'
-        });
-        res.end(JSON.stringify({
-            status: 'ok',
-            proxies: proxyList.length,
-            uptime: process.uptime()
-        }));
-        return;
-    }
-    res.writeHead(404);
-    res.end('Not found');
-});
-
-// WebSocket server
-const wss = new WebSocket.Server({ server });
-
-console.log(`[Proxy] Starting on port ${PORT}...`);
-
-wss.on('connection', async (clientSocket, req) => {
-    const url = new URL(req.url, `http://localhost:${PORT}`);
-    const region = url.searchParams.get('region');
-    const botName = url.searchParams.get('name') || 'SyncBot';
-    
-    console.log(`[${botName}] New connection, region: ${region}`);
-    
-    if (!region || !/\.moomoo\.io$/i.test(region)) {
-        console.error(`[${botName}] Invalid region. Closing.`);
-        clientSocket.close();
-        return;
-    }
-    
-    // Pick proxy
-    const proxyIdx = pickProxyIndex();
-    const proxyUrl = proxyIdx >= 0 ? proxyList[proxyIdx] : null;
-    const agent = proxyUrl ? makeAgent(proxyUrl) : null;
-    const proxyHost = proxyUrl ? getProxyHost(proxyUrl) : 'direct';
-    
-    console.log(`[${botName}] Using proxy: ${proxyHost}`);
-    
-    // Track state
-    if (proxyIdx >= 0 && proxyState[proxyIdx]) {
-        proxyState[proxyIdx].active++;
-    }
-    
-    // Generate token
-    console.log(`[${botName}] Generating token...`);
-    const token = await generateToken(agent, proxyIdx);
-    
-    if (!token) {
-        console.error(`[${botName}] Token generation failed. Closing.`);
-        if (proxyIdx >= 0 && proxyState[proxyIdx]) proxyState[proxyIdx].active--;
-        clientSocket.close();
-        return;
-    }
-    
-    // Add jitter before connecting (matching working version)
-    await sleep(rint(DIAL_JITTER_MS[0], DIAL_JITTER_MS[1]));
-    
-    console.log(`[${botName}] Connecting to MooMoo...`);
-    
-    const hostOnly = region.split(':')[0];
-    const moomooUrl = `wss://${region}/?token=${encodeURIComponent(token)}`;
-    
-    const wsOptions = {
-        servername: hostOnly,
-        headers: {
-            'Origin': BROWSER_HEADERS.Origin,
-            'User-Agent': BROWSER_HEADERS['User-Agent'],
-            'Referer': BROWSER_HEADERS.Referer,
-            'Accept-Language': BROWSER_HEADERS['Accept-Language']
-        },
-        perMessageDeflate: false
-    };
-    
-    if (agent) {
-        wsOptions.agent = agent;
-    }
-    
-    const upstream = new WebSocket(moomooUrl, wsOptions);
-    let keepAliveTimer = null;
-    let upstreamReady = false;
-    
-    // Cleanup function (matching working version's pattern)
     const cleanup = () => {
-        if (keepAliveTimer) {
-            clearInterval(keepAliveTimer);
-            keepAliveTimer = null;
-        }
-        if (proxyIdx >= 0 && proxyState[proxyIdx]) {
-            proxyState[proxyIdx].active--;
-        }
-        // Remove listeners to prevent memory leaks
-        clientSocket.off('message', onClientMessage);
-        clientSocket.off('close', onClientClose);
-        clientSocket.off('error', onClientError);
+        if (gameWs.readyState <= WebSocket.OPEN) gameWs.close();
+        if (clientWs.readyState <= WebSocket.OPEN) clientWs.close();
     };
-    
-    // Message handlers
-    const onUpstreamMessage = (msg) => {
-        if (clientSocket.readyState === WebSocket.OPEN) {
-            try { clientSocket.send(msg); } catch (e) {}
-        }
-    };
-    
-    const onClientMessage = (msg) => {
-        if (upstreamReady && upstream.readyState === WebSocket.OPEN) {
-            try { upstream.send(msg); } catch (e) {}
-        }
-    };
-    
-    const onClientClose = () => {
-        console.log(`[${botName}] Client closed`);
+
+    gameWs.on('close', (code, reason) => {
+        console.log(`[-] ${botName} Game DC (${code}) ${reason || ''}`);
         cleanup();
-        try { upstream.close(); } catch (e) {}
-    };
-    
-    const onClientError = (e) => {
-        console.error(`[${botName}] Client error:`, e.message);
-    };
-    
-    // Attach client listeners
-    clientSocket.on('message', onClientMessage);
-    clientSocket.on('close', onClientClose);
-    clientSocket.on('error', onClientError);
-    
-    // Upstream events
-    upstream.on('open', () => {
-        console.log(`[${botName}] CONNECTED to MooMoo via ${proxyHost}!`);
-        upstreamReady = true;
-        
-        // Start keepalive
-        keepAliveTimer = setInterval(() => {
-            try {
-                if (upstream.readyState === WebSocket.OPEN) {
-                    upstream.ping();
-                }
-            } catch (e) {}
-        }, KEEPALIVE_MS);
     });
-    
-    upstream.on('message', onUpstreamMessage);
-    
-    upstream.on('pong', () => {
-        // Connection alive
-    });
-    
-    upstream.on('close', (code, reasonBuf) => {
-        let reason = '';
-        try { 
-            reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString() : String(reasonBuf || ''); 
-        } catch {}
-        
-        console.log(`[${botName}] MooMoo closed (code=${code}${reason ? `, reason=${reason}` : ''})`);
-        upstreamReady = false;
+
+    clientWs.on('close', (code) => {
+        console.log(`[-] ${botName} Client DC (${code})`);
         cleanup();
-        
-        // Close client connection
-        try { clientSocket.close(); } catch (e) {}
     });
-    
-    upstream.on('error', (e) => {
-        console.error(`[${botName}] MooMoo error:`, e.message);
-        upstreamReady = false;
+
+    gameWs.on('error', (e) => {
+        console.log(`[X] ${botName} Game Error: ${e.message}`);
+        cleanup();
+    });
+
+    clientWs.on('error', (e) => {
+        console.log(`[X] ${botName} Client Error: ${e.message}`);
+        cleanup();
     });
 });
 
-// Start server
+// ========== STARTUP ==========
 server.listen(PORT, () => {
-    console.log(`[Proxy] Server running on port ${PORT}`);
-    console.log(`[Proxy] Health: http://localhost:${PORT}/health`);
+    console.log(`\n==============================================`);
+    console.log(`  ZOMBIE COMMANDER v6 — ROTATING SOCKS5 PROXIES`);
+    console.log(`  Port: ${PORT}`);
+    console.log(`  Proxy Pool: ${PROXY_LIST.length} proxies loaded`);
+    console.log(`==============================================\n`);
 });
