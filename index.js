@@ -145,13 +145,15 @@ wss.on('connection', async (clientWs, req) => {
     let upstreamReady = false;
     let gameWs; 
 
-    // ==========================================
+// ==========================================
     // POWERLINE.IO BYPASS VALVE
     // ==========================================
     if (target.includes('powerline.io') || url.searchParams.get('game') === 'powerline') {
         console.log(`[Powerline] Proxying raw binary connection...`);
         
-        // Attach listener immediately so no browser packets are lost
+        // GRAB THE DYNAMIC PROTOCOL FROM THE URL
+        const gameProtocol = url.searchParams.get('protocol') || "1707805";
+        
         clientWs.on('message', (data) => {
             if (upstreamReady && gameWs && gameWs.readyState === WebSocket.OPEN) {
                 gameWs.send(data);
@@ -160,8 +162,8 @@ wss.on('connection', async (clientWs, req) => {
             }
         });
 
-        // Connect directly to Powerline with correct subprotocol and headers
-        gameWs = new WebSocket(`wss://${target}/`, "1707805", {
+        // Use the dynamic gameProtocol here!
+        gameWs = new WebSocket(`wss://${target}/`, gameProtocol, {
             agent: connAgent,
             headers: { 
                 'Origin': 'https://powerline.io', 
