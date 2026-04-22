@@ -145,7 +145,64 @@ wss.on('connection', async (clientWs, req) => {
     let upstreamReady = false;
     let gameWs; 
 
-    // ===== TOKEN ACQUISITION =====
+    // ==========================================
+    // POWERLINE.IO BYPASS VALVE
+    // ==========================================
+    if (target.includes('powerline.io') || url.searchParams.get('game') === 'powerline') {
+        console.log(`[Powerline] Proxying raw binary connection...`);
+        
+        // Attach listener immediately so no browser packets are lost
+        clientWs.on('message', (data) => {
+            if (upstreamReady && gameWs && gameWs.readyState === WebSocket.OPEN) {
+                gameWs.send(data);
+            } else {
+                messageQueue.push(data);
+            }
+        });
+
+        // Connect directly to Powerline with correct subprotocol and headers
+        gameWs = new WebSocket(`wss://${target}/`, "1707805", {
+            agent: connAgent,
+            headers: { 
+                'Origin': 'https://powerline.io', 
+                'User-Agent': HEADERS['User-Agent'] 
+            },
+            rejectUnauthorized: false
+        });
+
+        gameWs.on('open', () => {
+            const elapsed = Date.now() - connStart;
+            console.log(`[>>] ${botName} CONNECTED to Powerline in ${elapsed}ms`);
+            upstreamReady = true;
+            
+            // Flush the buffer!
+            while (messageQueue.length > 0) {
+                const msg = messageQueue.shift();
+                if (gameWs.readyState === WebSocket.OPEN) gameWs.send(msg);
+            }
+        });
+
+        gameWs.on('message', (data) => {
+            if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
+        });
+
+        const cleanup = () => {
+            if (gameWs.readyState <= WebSocket.OPEN) gameWs.close();
+            if (clientWs.readyState <= WebSocket.OPEN) clientWs.close();
+        };
+
+        gameWs.on('close', (code, reason) => { console.log(`[-] ${botName} Powerline DC (${code})`); cleanup(); });
+        clientWs.on('close', () => cleanup());
+        gameWs.on('error', (e) => { console.log(`[X] ${botName} Powerline Error: ${e.message}`); cleanup(); });
+        clientWs.on('error', () => cleanup());
+        
+        return; // EXIT HERE: Do not run Moomoo.io token generation!
+    }
+
+    // ==========================================
+    // MOOMOO.IO LOGIC (Unchanged)
+    // ==========================================
+    
     const token = await generateToken(botName, connAgent, connLabel);
     if (!token) {
         console.log(`[X] ${botName}: Token failed.`);
@@ -161,10 +218,10 @@ wss.on('connection', async (clientWs, req) => {
         }
     });
 
-    // ===== CONNECT TO GAME =====
+    // Connect to Game
     const hostOnly = target.split(':')[0];
     gameWs = new WebSocket(`wss://${target}/?token=${encodeURIComponent(token)}`, {
-        agent: connAgent, // WebSocket routes via SOCKS5 proxy
+        agent: connAgent, 
         servername: hostOnly,
         headers: HEADERS,
         perMessageDeflate: false,
@@ -173,7 +230,7 @@ wss.on('connection', async (clientWs, req) => {
 
     gameWs.on('open', () => {
         const elapsed = Date.now() - connStart;
-        console.log(`[>>] ${botName} CONNECTED to game in ${elapsed}ms`);
+        console.log(`[>>] ${botName} CONNECTED to Moomoo in ${elapsed}ms`);
 
         upstreamReady = true;
         while (messageQueue.length > 0) {
@@ -219,7 +276,7 @@ wss.on('connection', async (clientWs, req) => {
 // ========== STARTUP ==========
 server.listen(PORT, () => {
     console.log(`\n==============================================`);
-    console.log(`  ZOMBIE COMMANDER v6 — ROTATING SOCKS5 PROXIES`);
+    console.log(`  UNIVERSAL COMMANDER v6.1 — SOCKS5 ENABLED`);
     console.log(`  Port: ${PORT}`);
     console.log(`  Proxy Pool: ${PROXY_LIST.length} proxies loaded`);
     console.log(`==============================================\n`);
