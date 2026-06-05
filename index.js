@@ -10,25 +10,76 @@ const { SocksProxyAgent } = require('socks-proxy-agent');
 // ==========================================
 const PORT = process.env.PORT || 8080;
 
-// ========== LOAD PROXIES FROM SECRET FILE ==========
-let PROXY_LIST =[];
-try {
-    // Reads the proxy list securely provided by Render Secret Files
-    const proxyData = fs.readFileSync('proxies.json', 'utf8');
-    PROXY_LIST = JSON.parse(proxyData);
-    console.log(`[+] Successfully loaded ${PROXY_LIST.length} proxies from proxies.json`);
-} catch (err) {
-    console.error('[!] Failed to load proxies.json. Make sure the Secret File is configured in Render.');
-    PROXY_LIST =[];
-}
+// ========== PROXY POOL: Webshare API (live) + proxies.json fallback ==========
+  const WEBSHARE_API_KEY    = process.env.WEBSHARE_API_KEY || '';
+  const WEBSHARE_REFRESH_MS = parseInt(process.env.WEBSHARE_REFRESH_MS || '3600000', 10);
 
-let proxyCursor = 0;
-function getNextProxy() {
-    if (PROXY_LIST.length === 0) return null;
-    const p = PROXY_LIST[proxyCursor];
-    proxyCursor = (proxyCursor + 1) % PROXY_LIST.length;
-    return p;
-}
+  let PROXY_LIST = [];
+
+  function loadProxiesFile() {                 // optional fallback if the Secret File still exists
+      try {
+          const list = JSON.parse(fs.readFileSync('proxies.json', 'utf8'));
+          if (Array.isArray(list) && list.length) {
+              PROXY_LIST = list;
+              console.log(`[+] Loaded ${list.length} proxies from proxies.json`);
+              return true;
+          }
+      } catch (e) { /* no file / bad file — fine when the API key is set */ }
+      return false;
+  }
+
+  function fetchWebshare() {                    // live list — survives Webshare's rotation
+      return new Promise((resolve, reject) => {
+          if (!WEBSHARE_API_KEY) return reject(new Error('WEBSHARE_API_KEY not set'));
+          const req = https.request({
+              hostname: 'proxy.webshare.io',
+              path: '/api/v2/proxy/list/?mode=direct&page_size=100',
+              method: 'GET',
+              headers: { Authorization: `Token ${WEBSHARE_API_KEY}` }
+          }, (res) => {
+              let body = '';
+              res.on('data', c => body += c);
+              res.on('end', () => {
+                  if (res.statusCode !== 200) return reject(new Error(`Webshare API ${res.statusCode}`));
+                  try {
+                      const json = JSON.parse(body);
+                      const list = (json.results || [])
+                          .filter(p => p.proxy_address && p.port)
+                          .map(p => ({ host: p.proxy_address, port: p.port, user: p.username, pass: p.password,
+  protocol: 'socks5' }));
+                      resolve(list);
+                  } catch (e) { reject(e); }
+              });
+          });
+          req.on('error', reject);
+          req.setTimeout(10000, () => req.destroy(new Error('timeout')));
+          req.end();
+      });
+  }
+
+  async function refreshWebshare() {
+      try {
+          const list = await fetchWebshare();
+          if (list.length) { PROXY_LIST = list; console.log(`[webshare] live list: ${list.length} proxies`); }
+      } catch (e) {
+          console.warn(`[webshare] refresh failed (${e.message}) — keeping ${PROXY_LIST.length} current`);
+      }
+  }
+
+  loadProxiesFile();                            // instant fallback if proxies.json is still there
+  if (WEBSHARE_API_KEY) {                        // then the live API takes over + refreshes hourly
+      refreshWebshare();
+      const _t = setInterval(refreshWebshare, WEBSHARE_REFRESH_MS);
+      if (_t.unref) _t.unref();
+  }
+
+  let proxyCursor = 0;
+  function getNextProxy() {
+      if (PROXY_LIST.length === 0) return null;
+      const p = PROXY_LIST[proxyCursor % PROXY_LIST.length];
+      proxyCursor = (proxyCursor + 1) % PROXY_LIST.length;
+      return p;
+  }
 
 // ========== SOCKS5 PROXY AGENT ==========
 function getProxyAgent(proxy) {
